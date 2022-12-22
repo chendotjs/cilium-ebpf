@@ -7,6 +7,14 @@ char __license[] SEC("license") = "Dual MIT/GPL";
 
 #define MAX_MAP_ENTRIES 16
 
+static inline __sum16 csum_fold(u32 csum)
+{
+	u32 sum = csum;
+	sum = (sum & 0xffff) + (sum >> 16);
+	sum = (sum & 0xffff) + (sum >> 16);
+	return ~sum;
+}
+
 /* Define an LRU hash map for storing packet count by source IPv4 address */
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -42,6 +50,32 @@ static __always_inline int parse_ip_src_addr(struct xdp_md *ctx, __u32 *ip_src_a
 
 	// Return the source IP address in network byte order.
 	*ip_src_addr = (__u32)(ip->saddr);
+
+	u16 old_csum = ip->check;
+	ip->check = 0;
+	struct iphdr iphdr_old = *ip;
+	ip->ttl--;
+	// ip->ttl++;
+
+	s64 csum_diff = bpf_csum_diff((__be32 *)&iphdr_old, sizeof(struct iphdr), (__be32 *)ip, sizeof(struct iphdr), 0);
+	bpf_printk("csum_diff: %llx\n", csum_diff);
+
+
+	// Method 1: 计算 diff 然后，在旧包的 checksum 基础上做增量更新。
+	// 参考: https://github.com/xdp-project/xdp-tutorial/blob/9807816aa19be3cba73f3d35061c7cacad161b86/packet-solutions/xdp_prog_kern_03.c#L119-L123
+	// bpf_csum_diff 的实现很简单，基于 csum_partial(). 这里计算基于修改 ttl 后的 iphdr 基于 iphdr_old 的增量。
+	// ~old_csum 代表的含义: ~(Σiphdr) = checksum， 因此 ~checksum = Σiphdr
+	u32 new_csum = bpf_csum_diff((__be32 *)&iphdr_old, sizeof(struct iphdr), (__be32 *)ip, sizeof(struct iphdr), ~old_csum);
+	bpf_printk("new_csum: %llx\n", new_csum);
+
+	// Method 2: 全量计算新的 csum
+	// 参考: https://github.com/lizrice/lb-from-scratch/blob/86c369c8366f8a4b4b563d759959c18245b678d9/xdp_lb_kern.h#L23-L28
+	// u32 new_csum = bpf_csum_diff(0, 0, (__be32 *)ip, sizeof(struct iphdr), 0);
+	// bpf_printk("new_csum: %llx\n", new_csum);
+
+	// 最后折叠 32bit 到 16bit
+	ip->check = csum_fold(new_csum);
+
 	return 1;
 }
 
